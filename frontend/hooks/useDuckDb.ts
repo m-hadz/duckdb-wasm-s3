@@ -1,0 +1,136 @@
+'use client';
+
+import { useEffect, useState } from 'react';
+import type { AsyncDuckDB, AsyncDuckDBConnection } from '@duckdb/duckdb-wasm';
+
+type DuckDbInstance = {
+  db: AsyncDuckDB;
+  conn: AsyncDuckDBConnection;
+};
+
+let instancePromise: Promise<DuckDbInstance> | null = null;
+
+const TABLES = ['recipes', 'reviews'] as const;
+
+function requireEnv(value: string | undefined, name: string): string {
+  if (!value) throw new Error(`Falta la variable de entorno ${name}`);
+  return value;
+}
+
+function sqlString(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+async function createInstance(): Promise<DuckDbInstance> {
+  const duckdb = await import('@duckdb/duckdb-wasm');
+
+  const bundle = await duckdb.selectBundle({
+    mvp: {
+      mainModule: '/duckdb/duckdb-mvp.wasm',
+      mainWorker: '/duckdb/duckdb-browser-mvp.worker.js',
+    },
+    eh: {
+      mainModule: '/duckdb/duckdb-eh.wasm',
+      mainWorker: '/duckdb/duckdb-browser-eh.worker.js',
+    },
+  });
+
+  const worker = new Worker(bundle.mainWorker!);
+  const logger = new duckdb.ConsoleLogger(duckdb.LogLevel.WARNING);
+  const db = new duckdb.AsyncDuckDB(logger, worker);
+
+  try {
+    await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+    const conn = await db.connect();
+
+    const endpoint = new URL(
+      requireEnv(process.env.NEXT_PUBLIC_S3_ENDPOINT, 'NEXT_PUBLIC_S3_ENDPOINT'),
+    );
+    const bucket = requireEnv(process.env.NEXT_PUBLIC_S3_BUCKET, 'NEXT_PUBLIC_S3_BUCKET');
+
+    const views = TABLES.map(
+      (name) =>
+        `CREATE OR REPLACE VIEW ${name} AS
+          SELECT * FROM read_parquet(${sqlString(`s3://${bucket}/${name}.parquet`)});`,
+    ).join('\n');
+    await conn.query(`
+      SET home_directory='/tmp';
+      SET autoinstall_known_extensions=true;
+      SET autoload_known_extensions=true;
+      LOAD httpfs;
+      SET s3_region='us-east-1';
+      SET s3_endpoint=${sqlString(endpoint.host)};
+      SET s3_url_style='path';
+      SET s3_use_ssl=${endpoint.protocol === 'https:'};
+      ${views}
+    `);
+
+    try {
+      await conn.query(`
+        SET enable_http_metadata_cache=true;
+        SET enable_object_cache=true;
+      `);
+    } catch (e) {
+      console.warn('DuckDB: no se pudieron activar las cachés de metadatos', e);
+    }
+
+    return { db, conn };
+  } catch (error) {
+    await db.terminate().catch(() => { });
+    throw error;
+  }
+}
+
+export function getDuckDb(): Promise<DuckDbInstance> {
+  if (!instancePromise) {
+    instancePromise = createInstance().catch((error) => {
+      instancePromise = null;
+      throw error;
+    });
+  }
+  return instancePromise;
+}
+
+type State = {
+  instance: DuckDbInstance | null;
+  error: Error | null;
+  loading: boolean;
+};
+
+export function useDuckDb() {
+  const [state, setState] = useState<State>({
+    instance: null,
+    error: null,
+    loading: true,
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+
+    getDuckDb().then(
+      (instance) => {
+        if (!cancelled) setState({ instance, error: null, loading: false });
+      },
+      (error) => {
+        if (cancelled) return;
+        console.error('Failed to initialize DuckDB:', error);
+        setState({
+          instance: null,
+          error: error instanceof Error ? error : new Error(String(error)),
+          loading: false,
+        });
+      },
+    );
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return {
+    duckDb: state.instance?.db ?? null,
+    conn: state.instance?.conn ?? null,
+    error: state.error,
+    loading: state.loading,
+  };
+}

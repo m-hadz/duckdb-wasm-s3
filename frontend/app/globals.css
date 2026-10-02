@@ -1,0 +1,36 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #0e0e0f;
+  --surface: #161618;
+  --surface-2: #1e1e21;
+  --border: #2a2a2e;
+  --border-hover: #3e3e44;
+  --text: #e8e8ea;
+  --text-muted: #6b6b72;
+  --text-dim: #3e3e44;
+  --accent: #4f8ef7;
+  --accent-dim: rgba(79, 142, 247, 0.12);
+  --error: #e05555;
+  --error-dim: rgba(224, 85, 85, 0.1);
+  --success: #4caf82;
+  --radius: 4px;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'IBM Plex Sans', sans-serif;
+  font-weight: 400;
+  min-height: 100vh;
+}
