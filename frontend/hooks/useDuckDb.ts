@@ -12,11 +12,6 @@ let instancePromise: Promise<DuckDbInstance> | null = null;
 
 const TABLES = ['recipes', 'reviews'] as const;
 
-function requireEnv(value: string | undefined, name: string): string {
-  if (!value) throw new Error(`Falta la variable de entorno ${name}`);
-  return value;
-}
-
 function sqlString(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
@@ -43,25 +38,16 @@ async function createInstance(): Promise<DuckDbInstance> {
     await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
     const conn = await db.connect();
 
-    const endpoint = new URL(
-      requireEnv(process.env.NEXT_PUBLIC_S3_ENDPOINT, 'NEXT_PUBLIC_S3_ENDPOINT'),
-    );
-    const bucket = requireEnv(process.env.NEXT_PUBLIC_S3_BUCKET, 'NEXT_PUBLIC_S3_BUCKET');
-
     const views = TABLES.map(
       (name) =>
         `CREATE OR REPLACE VIEW ${name} AS
-          SELECT * FROM read_parquet(${sqlString(`s3://${bucket}/${name}.parquet`)});`,
+          SELECT * FROM read_parquet(${sqlString(new URL(`/s3/${name}.parquet`, window.location.origin).href)});`,
     ).join('\n');
     await conn.query(`
       SET home_directory='/tmp';
       SET autoinstall_known_extensions=true;
       SET autoload_known_extensions=true;
       LOAD httpfs;
-      SET s3_region='us-east-1';
-      SET s3_endpoint=${sqlString(endpoint.host)};
-      SET s3_url_style='path';
-      SET s3_use_ssl=${endpoint.protocol === 'https:'};
       ${views}
     `);
 

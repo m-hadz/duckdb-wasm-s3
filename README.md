@@ -17,5 +17,5 @@ docker compose up -d --build
 ```
 
 - App: http://localhost:3000
-- API S3: http://localhost:9000
+- Archivos (proxy de Next a MinIO): http://localhost:3000/s3/<archivo>.parquet
 - Consola MinIO: http://localhost:9001

@@ -11,8 +11,8 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?define MINIO_ROOT_USER en .env}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?define MINIO_ROOT_PASSWORD en .env}
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - minio-data:/data
     healthcheck:
@@ -41,10 +41,10 @@ services:
     build:
       context: ./frontend
       args:
-        NEXT_PUBLIC_S3_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:9000}
-        NEXT_PUBLIC_S3_BUCKET: ${S3_BUCKET:-data}
+        S3_INTERNAL_ENDPOINT: http://minio:9000
+        S3_BUCKET: ${S3_BUCKET:-data}
     ports:
-      - "3000:3000"
+      - "${FRONTEND_PORT:-3000}:3000"
     depends_on:
       minio-init:
         condition: service_completed_successfully

@@ -1,5 +1,16 @@
+const s3Endpoint = process.env.S3_INTERNAL_ENDPOINT ?? 'http://localhost:9000';
+const s3Bucket = process.env.S3_BUCKET ?? 'data';
+
 const nextConfig = {
   output: 'standalone',
+  async rewrites() {
+    return [
+      {
+        source: '/s3/:path*',
+        destination: `${s3Endpoint}/${s3Bucket}/:path*`,
+      },
+    ];
+  },
   async headers() {
     return [
       {
