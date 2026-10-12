@@ -1,0 +1,12 @@
+duckdb-wasm con DuckDB reemplazado por el fork de duckpgq
+built_at:        2026-10-12T00:21:39Z
+duckdb-wasm:     https://github.com/duckdb/duckdb-wasm @ ef8a4f8912b6e7f62bc0cc490145ebd391b79e1f (npm 1.33.1-dev57.0)
+duckdb:          https://github.com/cwida/duckdb-pgq @ 0beae3800326d773a591b7f7cb554b7556a681ec (reportada como v1.5.4)
+emscripten:      3.1.71 (emscripten/emsdk@sha256:9922c93314b63a1d9ceba2e76f03737f1f9cc4b7350341211e2d3555633ffdd5)
+targets:         eh
+duckpgq:         community-extensions.duckdb.org/v1.5.4/wasm_*/duckpgq.duckdb_extension.wasm
+
+sha256:
+cd89206f3aa09802f35879eea2903cca7a69a4d7bd16b3a47c9d55991d5710ee  ./duckdb-browser-eh.worker.js
+b45f926320a1b90dea781abc1c489ff61019f97686302f95db300c0550b5beeb  ./duckdb-eh.wasm
+6f6c79002f976bffa25c9fe22bb3ebe91a3ac082e521a5301ab05bdf95b116b0  ./extensions/v1.5.4/wasm_eh/duckpgq.duckdb_extension.wasm

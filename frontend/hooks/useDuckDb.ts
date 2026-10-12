@@ -51,6 +51,12 @@ async function createInstance(): Promise<DuckDbInstance> {
       ${views}
     `);
 
+    // duckpgq solo carga con el build propio de duckdb-wasm (vendor/duckdb-wasm-pgq, ver tools/duckdb-wasm-pgq).
+    await conn.query(`
+      INSTALL duckpgq FROM community;
+      LOAD duckpgq;
+    `);
+
     try {
       await conn.query(`
         SET enable_http_metadata_cache=true;
