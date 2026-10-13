@@ -76,11 +76,6 @@ async function createInstance(): Promise<DuckDbInstance> {
       ${views}
     `);
 
-    await conn.query(`
-      INSTALL duckpgq FROM community;
-      LOAD duckpgq;
-    `);
-
     try {
       await conn.query(`
         SET enable_http_metadata_cache=true;
