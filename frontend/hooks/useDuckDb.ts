@@ -10,10 +10,33 @@ type DuckDbInstance = {
 
 let instancePromise: Promise<DuckDbInstance> | null = null;
 
-const TABLES = ['recipes', 'reviews'] as const;
-
 function sqlString(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
+}
+
+function sqlIdentifier(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+async function listParquetKeys(): Promise<string[]> {
+  const keys: string[] = [];
+  let token: string | null = null;
+  do {
+    const params = new URLSearchParams({ 'list-type': '2', delimiter: '/' });
+    if (token) params.set('continuation-token', token);
+    const res = await fetch(`/s3?${params}`);
+    if (!res.ok) throw new Error(`No se pudo listar el bucket (${res.status})`);
+    const xml = new DOMParser().parseFromString(await res.text(), 'application/xml');
+    for (const el of xml.querySelectorAll('Contents > Key')) {
+      const key = el.textContent ?? '';
+      if (key.endsWith('.parquet')) keys.push(key);
+    }
+    token =
+      xml.querySelector('IsTruncated')?.textContent === 'true'
+        ? xml.querySelector('NextContinuationToken')?.textContent ?? null
+        : null;
+  } while (token);
+  return keys;
 }
 
 async function createInstance(): Promise<DuckDbInstance> {
@@ -38,11 +61,13 @@ async function createInstance(): Promise<DuckDbInstance> {
     await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
     const conn = await db.connect();
 
-    const views = TABLES.map(
-      (name) =>
-        `CREATE OR REPLACE VIEW ${name} AS
-          SELECT * FROM read_parquet(${sqlString(new URL(`/s3/${name}.parquet`, window.location.origin).href)});`,
-    ).join('\n');
+    const views = (await listParquetKeys())
+      .map(
+        (key) =>
+          `CREATE OR REPLACE VIEW ${sqlIdentifier(key.slice(0, -'.parquet'.length))} AS
+            SELECT * FROM read_parquet(${sqlString(new URL(`/s3/${encodeURIComponent(key)}`, window.location.origin).href)});`,
+      )
+      .join('\n');
     await conn.query(`
       SET home_directory='/tmp';
       SET autoinstall_known_extensions=true;
@@ -51,7 +76,6 @@ async function createInstance(): Promise<DuckDbInstance> {
       ${views}
     `);
 
-    // duckpgq solo carga con el build propio de duckdb-wasm (vendor/duckdb-wasm-pgq, ver tools/duckdb-wasm-pgq).
     await conn.query(`
       INSTALL duckpgq FROM community;
       LOAD duckpgq;
