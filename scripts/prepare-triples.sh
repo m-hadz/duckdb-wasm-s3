@@ -43,9 +43,12 @@ esac
 
 # Row groups de 100k tripletas: las estadísticas min/max por row group son las que permiten saltarse
 # casi todo el archivo cuando el patrón fija la primera columna de la permutación.
-duckdb -c "
-  SET preserve_insertion_order = true;
-  CREATE TEMP TABLE triples AS $triples;
+# Base en disco y no en memoria: con ~100 M de tripletas la tabla no cabe en RAM.
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/triples.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+duckdb "$tmp/triples.duckdb" -c "
+  SET temp_directory = '$tmp/spill';
+  CREATE TABLE triples AS $triples;
   COPY (FROM triples ORDER BY s, p, o) TO 'data/${prefix}_spo.parquet' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000);
   COPY (FROM triples ORDER BY p, o, s) TO 'data/${prefix}_pos.parquet' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000);
   COPY (FROM triples ORDER BY o, s, p) TO 'data/${prefix}_osp.parquet' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000);
