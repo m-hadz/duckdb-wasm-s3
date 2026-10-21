@@ -1,0 +1,125 @@
+diff --git a/include/r2rml/MappingParser.h b/include/r2rml/MappingParser.h
+index 14d8779..0d41a6b 100644
+--- a/include/r2rml/MappingParser.h
++++ b/include/r2rml/MappingParser.h
+@@ -199,6 +199,21 @@ public:
+ 	 */
+ 	static R2RMLMapping parseMultiple(const std::vector<std::string> &mappingFilePaths,
+ 	                                  bool ignoreNonFatalErrors = true, bool forceYarrrml = false);
++
++	/// A mapping document whose contents the caller already read, e.g. through
++	/// DuckDB's virtual FileSystem (needed in WASM, where the mapping may live
++	/// behind HTTP and libc file I/O is not available to extensions).
++	/// `path` selects the parser by extension and labels the source; `baseUri`
++	/// resolves relative IRIs such as "#TriplesMap1".
++	struct Source {
++		std::string path;
++		std::string content;
++		std::string baseUri;
++	};
++
++	/// Same as parseMultiple(), but never touches the filesystem.
++	static R2RMLMapping parseMultipleFromStrings(const std::vector<Source> &sources,
++	                                             bool ignoreNonFatalErrors = true, bool forceYarrrml = false);
+ };
+ 
+ } // namespace r2rml
+diff --git a/include/r2rml/R2RMLParser.h b/include/r2rml/R2RMLParser.h
+index 90d94f5..3207d6f 100644
+--- a/include/r2rml/R2RMLParser.h
++++ b/include/r2rml/R2RMLParser.h
+@@ -64,6 +64,8 @@ public:
+ 	 */
+ 	void collectFile(const std::string &mappingFilePath, TripleCollector &collector);
+ 
++	void collectString(const std::string &turtleText, const std::string &baseUri, TripleCollector &collector);
++
+ 	/**
+ 	 * Build the R2RML object model from statements already gathered in
+ 	 * `collector`, without parsing any Turtle text. Intended for callers
+diff --git a/include/yarrrml/YARRRMLParser.h b/include/yarrrml/YARRRMLParser.h
+index 5b73f41..3b963fb 100644
+--- a/include/yarrrml/YARRRMLParser.h
++++ b/include/yarrrml/YARRRMLParser.h
+@@ -57,6 +57,8 @@ public:
+ 	 * key) always throw std::runtime_error.
+ 	 */
+ 	void collectFile(const std::string &yarrrmlFilePath, r2rml::TripleCollector &collector);
++
++	void collectString(const std::string &yamlText, const std::string &baseUri, r2rml::TripleCollector &collector);
+ };
+ 
+ } // namespace yarrrml
+diff --git a/src/r2rml/R2RMLParser.cpp b/src/r2rml/R2RMLParser.cpp
+index 29c82bc..fd6ae56 100644
+--- a/src/r2rml/R2RMLParser.cpp
++++ b/src/r2rml/R2RMLParser.cpp
+@@ -936,6 +936,20 @@ void R2RMLParser::collectFile(const std::string &mappingFilePath, TripleCollecto
+ 	serd_reader_free(reader);
+ }
+ 
++void R2RMLParser::collectString(const std::string &turtleText, const std::string &baseUri,
++                                TripleCollector &collector) {
++	SerdReader *reader =
++	    serd_reader_new(SERD_TURTLE, &collector, nullptr, cbBase, cbPrefix, cbStatement, /*end_sink=*/nullptr);
++	serd_reader_set_error_sink(reader, cbError, &collector);
++
++	SerdNode baseNode = serd_node_from_string(SERD_URI, reinterpret_cast<const uint8_t *>(baseUri.c_str()));
++	collector.setBase(&baseNode);
++
++	serd_reader_read_string(reader, reinterpret_cast<const uint8_t *>(turtleText.c_str()));
++
++	serd_reader_free(reader);
++}
++
+ R2RMLMapping R2RMLParser::parse(const std::string &mappingFilePath, bool ignoreNonFatalErrors) {
+ 	TripleCollector collector;
+ 	collectFile(mappingFilePath, collector);
+diff --git a/src/yarrrml/MappingParserFactory.cpp b/src/yarrrml/MappingParserFactory.cpp
+index 980c46a..040cde6 100644
+--- a/src/yarrrml/MappingParserFactory.cpp
++++ b/src/yarrrml/MappingParserFactory.cpp
+@@ -48,4 +48,24 @@ R2RMLMapping MappingParser::parseMultiple(const std::vector<std::string> &mappin
+ 	return R2RMLParser().parseCollected(collector, ignoreNonFatalErrors);
+ }
+ 
++R2RMLMapping MappingParser::parseMultipleFromStrings(const std::vector<Source> &sources, bool ignoreNonFatalErrors,
++                                                     bool forceYarrrml) {
++	TripleCollector collector;
++
++	for (const Source &source : sources) {
++		collector.beginSource(source.path);
++
++		if (forceYarrrml || yarrrml::YARRRMLParser::hasYarrrmlExtension(source.path)) {
++			yarrrml::YARRRMLParser().collectString(source.content, source.baseUri, collector);
++		} else if (hasTtlExtension(source.path)) {
++			R2RMLParser().collectString(source.content, source.baseUri, collector);
++		} else {
++			throw std::runtime_error("No parser available for file: " + source.path +
++			                         " (expected .ttl for R2RML or .yml/.yaml/.yarrrml for YARRRML)");
++		}
++	}
++
++	return R2RMLParser().parseCollected(collector, ignoreNonFatalErrors);
++}
++
+ } // namespace r2rml
+diff --git a/src/yarrrml/YARRRMLParser.cpp b/src/yarrrml/YARRRMLParser.cpp
+index f1cf6e9..f1ae3a4 100644
+--- a/src/yarrrml/YARRRMLParser.cpp
++++ b/src/yarrrml/YARRRMLParser.cpp
+@@ -992,6 +992,14 @@ void YARRRMLParser::collectFile(const std::string &yarrrmlFilePath, r2rml::Tripl
+ 	emitYarrrmlDocument(yamlText, collector);
+ }
+ 
++void YARRRMLParser::collectString(const std::string &yamlText, const std::string &baseUri,
++                                  r2rml::TripleCollector &collector) {
++	SerdNode base = serd_node_from_string(SERD_URI, reinterpret_cast<const uint8_t *>(baseUri.c_str()));
++	collector.setBase(&base);
++
++	emitYarrrmlDocument(yamlText, collector);
++}
++
+ r2rml::R2RMLMapping YARRRMLParser::parse(const std::string &yarrrmlFilePath, bool ignoreNonFatalErrors) {
+ 	r2rml::TripleCollector collector;
+ 	collectFile(yarrrmlFilePath, collector);

@@ -1,0 +1,347 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 038fbf5..5fee1db 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -72,6 +72,10 @@ FetchContent_Declare(
+   GIT_REPOSITORY https://github.com/nonodename/sql2rdf.git
+   GIT_TAG v2.2.2
+ )
++# Build local: usa el sql2rdf parcheado (parseMultipleFromStrings) en vez del tag.
++if(DEFINED ENV{SQL2RDF_SOURCE_DIR})
++  set(FETCHCONTENT_SOURCE_DIR_SQL2RDF $ENV{SQL2RDF_SOURCE_DIR})
++endif()
+ 
+ FetchContent_MakeAvailable(sql2rdf)
+ 
+diff --git a/extension_config.cmake b/extension_config.cmake
+index 7dc8223..27ad379 100644
+--- a/extension_config.cmake
++++ b/extension_config.cmake
+@@ -58,7 +58,7 @@ if (EMSCRIPTEN)
+         SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
+         LOAD_TESTS
+         EXTENSION_VERSION "${RDF_EXTENSION_VERSION}"
+-        LINKED_LIBS "$<TARGET_FILE:serd> $<TARGET_FILE:sql2rdf_yarrrml> $<TARGET_FILE:sql2rdf_r2rml> $<TARGET_FILE:sql2rdf_sparql> $<TARGET_FILE:sql2rdf_sparql2sql> $<TARGET_FILE:yaml-cpp>"
++        LINKED_LIBS "$<TARGET_FILE:serd> $<TARGET_FILE:sql2rdf_yarrrml> $<TARGET_FILE:sql2rdf_r2rml> $<TARGET_FILE:sql2rdf_rdf> $<TARGET_FILE:sql2rdf_sparql> $<TARGET_FILE:sql2rdf_sparql2sql> $<TARGET_FILE:sql2rdf_type_catalog_loader> $<TARGET_FILE:yaml-cpp>"
+     )
+ else()
+     duckdb_extension_load(rdf
+diff --git a/src/include/r2rml_copy.hpp b/src/include/r2rml_copy.hpp
+index f131d4b..69bdf8a 100644
+--- a/src/include/r2rml_copy.hpp
++++ b/src/include/r2rml_copy.hpp
+@@ -12,23 +12,24 @@ namespace duckdb {
+ 
+ void RegisterR2RMLCopy(ExtensionLoader &loader);
+ 
+-// Resolves `path_or_glob` - a literal path or a glob pattern such as
+-// "mappings/*.ttl" - to a sorted list of matching file paths. Resolution is
+-// always against the local filesystem: sql2rdf's parsers read mapping files
+-// directly (not through DuckDB's virtual FileSystem), and this also lets it
+-// be called from contexts with no ClientContext at all, such as the SPARQL
+-// parser_override hot path in sparql_parser.cpp. Returns an empty vector if
+-// nothing matches.
+-std::vector<std::string> ResolveMappingFiles(const std::string &path_or_glob);
++// Resolves `path_or_glob` - a literal path, a URL or a glob pattern such as
++// "mappings/*.ttl" - to a sorted list of matching file paths. With a
++// ClientContext, resolution goes through DuckDB's virtual FileSystem (httpfs,
++// s3, files registered in duckdb-wasm, ...); without one (the SPARQL
++// parser_override hot path in sparql_parser.cpp) it uses DuckDB's local
++// FileSystem. Returns an empty vector if nothing matches.
++std::vector<std::string> ResolveMappingFiles(const std::string &path_or_glob, ClientContext *context = nullptr);
+ 
+ // Parses the paths passed as a vector as
+ // R2RML (Turtle) and/or YARRRML (YAML) mapping file(s), dispatching each file
+ // on its extension (yarrrml::YARRRMLParser::hasYarrrmlExtension) and merging
+-// multiple matches via sql2rdf's MappingParser::parseMultiple. Shared with
+-// sparql_to_sql.cpp so mapping-format dispatch lives in exactly one place.
++// multiple matches via sql2rdf's MappingParser::parseMultipleFromStrings. The
++// files are read through the same FileSystem as ResolveMappingFiles, never by
++// sql2rdf itself, so this also works in WASM. Shared with sparql_to_sql.cpp so
++// mapping-format dispatch lives in exactly one place.
+ // Throws std::runtime_error if no file matches or if parsing fails.
+ r2rml::R2RMLMapping ParseR2RMLOrYarrrmlMapping(std::vector<std::string> paths, const std::string original_path,
+-                                               bool ignoreNonFatalErrors);
++                                               bool ignoreNonFatalErrors, ClientContext *context = nullptr);
+ 
+ // SQLConnection backed by the live DuckDB instance via a fresh Connection.
+ // Used for full R2RML mode where processDatabase() runs the mapping's SQL
+diff --git a/src/r2rml_copy.cpp b/src/r2rml_copy.cpp
+index 23a5572..fedd331 100644
+--- a/src/r2rml_copy.cpp
++++ b/src/r2rml_copy.cpp
+@@ -48,34 +48,88 @@ constexpr const char *const XSD_DATETIME_STAMP = "http://www.w3.org/2001/XMLSche
+ 
+ namespace duckdb {
+ 
+-std::vector<std::string> ResolveMappingFiles(const std::string &path_or_glob) {
++namespace {
++
++// Calls `fn` with the FileSystem mapping files are resolved and read through:
++// the context's virtual FileSystem when there is one, DuckDB's local one otherwise.
++template <class FN>
++auto WithMappingFileSystem(ClientContext *context, FN &&fn) -> decltype(fn(std::declval<FileSystem &>())) {
++	if (context) {
++		return fn(FileSystem::GetFileSystem(*context));
++	}
+ 	auto local_fs = FileSystem::CreateLocal();
+-	auto matches = local_fs->Glob(path_or_glob);
+-	std::vector<std::string> paths;
+-	paths.reserve(matches.size());
+-	for (auto &match : matches) {
+-		paths.push_back(match.path);
+-	}
+-	std::sort(paths.begin(), paths.end());
+-	return paths;
++	return fn(*local_fs);
++}
++
++bool IsUrl(const std::string &path) {
++	return path.find("://") != std::string::npos;
++}
++
++std::string ReadMappingFile(FileSystem &fs, const std::string &path) {
++	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
++	std::string content;
++	char buffer[16384];
++	while (true) {
++		auto n = handle->Read(buffer, sizeof(buffer));
++		if (n <= 0) {
++			break;
++		}
++		content.append(buffer, static_cast<size_t>(n));
++	}
++	return content;
++}
++
++std::string MappingBaseUri(FileSystem &fs, const std::string &path) {
++	if (IsUrl(path)) {
++		return path;
++	}
++	auto absolute = fs.IsPathAbsolute(path) ? path : fs.JoinPath(FileSystem::GetWorkingDirectory(), path);
++	return (absolute.rfind('/', 0) == 0 ? "file://" : "file:///") + absolute;
++}
++
++} // namespace
++
++std::vector<std::string> ResolveMappingFiles(const std::string &path_or_glob, ClientContext *context) {
++	return WithMappingFileSystem(context, [&](FileSystem &fs) {
++		std::vector<std::string> paths;
++		// Remote filesystems may not list (plain HTTP cannot); a literal URL is
++		// taken as-is and a missing file surfaces when it is read.
++		if (IsUrl(path_or_glob) && !FileSystem::HasGlob(path_or_glob)) {
++			paths.push_back(path_or_glob);
++			return paths;
++		}
++		auto matches = fs.Glob(path_or_glob);
++		paths.reserve(matches.size());
++		for (auto &match : matches) {
++			paths.push_back(match.path);
++		}
++		std::sort(paths.begin(), paths.end());
++		return paths;
++	});
+ }
+ 
+ r2rml::R2RMLMapping ParseR2RMLOrYarrrmlMapping(std::vector<std::string> paths, const std::string original_path,
+-                                               bool ignoreNonFatalErrors) {
++                                               bool ignoreNonFatalErrors, ClientContext *context) {
+ 	if (paths.empty()) {
+ 		throw std::runtime_error("No mapping files matched: " + original_path);
+ 	}
+-	return r2rml::MappingParser::parseMultiple(paths, ignoreNonFatalErrors);
++	std::vector<r2rml::MappingParser::Source> sources;
++	WithMappingFileSystem(context, [&](FileSystem &fs) {
++		for (auto &path : paths) {
++			sources.push_back({path, ReadMappingFile(fs, path), MappingBaseUri(fs, path)});
++		}
++	});
++	return r2rml::MappingParser::parseMultipleFromStrings(sources, ignoreNonFatalErrors);
+ }
+ 
+ inline void CanCallInsideOut(DataChunk &args, ExpressionState &state, Vector &result) {
+ 	auto &name_vector = args.data[0];
+ 	UnaryExecutor::Execute<string_t, bool>(name_vector, result, args.size(), [&](string_t name) {
+-		auto paths = ResolveMappingFiles(name.GetString());
++		auto paths = ResolveMappingFiles(name.GetString(), &state.GetContext());
+ 		if (paths.empty()) {
+ 			return false;
+ 		}
+-		r2rml::R2RMLMapping mapping = ParseR2RMLOrYarrrmlMapping(paths, name.GetString(), true);
++		r2rml::R2RMLMapping mapping = ParseR2RMLOrYarrrmlMapping(paths, name.GetString(), true, &state.GetContext());
+ 		return mapping.isValidInsideOut();
+ 	});
+ }
+@@ -83,13 +137,13 @@ inline void CanCallInsideOut(DataChunk &args, ExpressionState &state, Vector &re
+ inline void IsValidR2RML(DataChunk &args, ExpressionState &state, Vector &result) {
+ 	auto &name_vector = args.data[0];
+ 	UnaryExecutor::Execute<string_t, bool>(name_vector, result, args.size(), [&](string_t name) {
+-		auto paths = ResolveMappingFiles(name.GetString());
++		auto paths = ResolveMappingFiles(name.GetString(), &state.GetContext());
+ 		if (paths.empty()) {
+ 			return false;
+ 		}
+ 		r2rml::R2RMLMapping mapping;
+ 		try {
+-			mapping = ParseR2RMLOrYarrrmlMapping(paths, name.GetString(), true);
++			mapping = ParseR2RMLOrYarrrmlMapping(paths, name.GetString(), true, &state.GetContext());
+ 		} catch (const std::runtime_error &e) {
+ 			return false;
+ 		}
+@@ -577,7 +631,7 @@ static unique_ptr<FunctionData> R2RMLCopyToBind(ClientContext &context, CopyFunc
+ 	}
+ 	std::string mapping_path = mapping_it->second[0].GetValue<std::string>();
+ 
+-	if (ResolveMappingFiles(mapping_path).empty()) {
++	if (ResolveMappingFiles(mapping_path, &context).empty()) {
+ 		throw IOException("R2RML mapping file not found: " + mapping_path);
+ 	}
+ 
+@@ -595,8 +649,9 @@ static unique_ptr<FunctionData> R2RMLCopyToBind(ClientContext &context, CopyFunc
+ 
+ 	std::shared_ptr<r2rml::R2RMLMapping> mapping;
+ 	try {
+-		auto paths = ResolveMappingFiles(mapping_path);
+-		mapping = std::make_shared<r2rml::R2RMLMapping>(ParseR2RMLOrYarrrmlMapping(paths, mapping_path, ignore_nfe));
++		auto paths = ResolveMappingFiles(mapping_path, &context);
++		mapping = std::make_shared<r2rml::R2RMLMapping>(
++		    ParseR2RMLOrYarrrmlMapping(paths, mapping_path, ignore_nfe, &context));
+ 	} catch (const std::runtime_error &e) {
+ 		throw InvalidInputException("R2RML mapping parse error: %s", e.what());
+ 	}
+@@ -655,7 +710,7 @@ static unique_ptr<GlobalFunctionData> R2RMLCopyToInitializeGlobal(ClientContext
+ 	return std::move(state);
+ }
+ 
+-static unique_ptr<LocalFunctionData> R2RMLCopyToInitializeLocal(ExecutionContext &, FunctionData &bind_data) {
++static unique_ptr<LocalFunctionData> R2RMLCopyToInitializeLocal(ExecutionContext &context, FunctionData &bind_data) {
+ 	auto &bind = bind_data.Cast<R2RMLWriteBindData>();
+ 	auto local = make_uniq<R2RMLWriteLocalState>();
+ 
+@@ -663,9 +718,9 @@ static unique_ptr<LocalFunctionData> R2RMLCopyToInitializeLocal(ExecutionContext
+ 	// no-ops (Finalize does the work single-threaded), so skip the reparse there.
+ 	if (bind.inside_out_mode) {
+ 		try {
+-			auto paths = ResolveMappingFiles(bind.mapping_file_path);
+-			local->mapping = std::make_shared<r2rml::R2RMLMapping>(
+-			    ParseR2RMLOrYarrrmlMapping(paths, bind.mapping_file_path, bind.ignore_non_fatal_errors));
++			auto paths = ResolveMappingFiles(bind.mapping_file_path, &context.client);
++			local->mapping = std::make_shared<r2rml::R2RMLMapping>(ParseR2RMLOrYarrrmlMapping(
++			    paths, bind.mapping_file_path, bind.ignore_non_fatal_errors, &context.client));
+ 		} catch (const std::runtime_error &e) {
+ 			throw InternalException("Failed to re-parse R2RML mapping for parallel write: %s", e.what());
+ 		}
+diff --git a/src/serd_buffer.cpp b/src/serd_buffer.cpp
+index 5f47d4d..e982277 100644
+--- a/src/serd_buffer.cpp
++++ b/src/serd_buffer.cpp
+@@ -8,6 +8,21 @@
+ 
+ static const size_t READ_BUFFER_SIZE = 1024 * 1024;
+ 
++// serd treats a short read as end of stream (fread semantics), but a FileHandle
++// may legitimately return less than asked for - duckdb-wasm's HTTP reads come
++// back in 16 KiB pieces - so keep reading until the request is filled or EOF.
++static int64_t ReadFully(duckdb::FileHandle &handle, void *buf, duckdb::idx_t nr_bytes) {
++	duckdb::idx_t total = 0;
++	while (total < nr_bytes) {
++		int64_t n = handle.Read(static_cast<char *>(buf) + total, nr_bytes - total);
++		if (n <= 0) {
++			break;
++		}
++		total += (duckdb::idx_t)n;
++	}
++	return (int64_t)total;
++}
++
+ static SerdSyntax MapSyntaxFromFileType(ITriplesBuffer::FileType file_type) {
+ 	switch (file_type) {
+ 	case ITriplesBuffer::TURTLE:
+@@ -93,7 +108,7 @@ void SerdBuffer::StartParse() {
+ 		auto self = static_cast<SerdBuffer *>(stream);
+ 		if (!self || !self->_file_handle)
+ 			return 0;
+-		int64_t read = self->_file_handle->Read(buf, (idx_t)nmemb);
++		int64_t read = ReadFully(*self->_file_handle, buf, (idx_t)nmemb);
+ 		if (read > 0 && self->_progress_counter) {
+ 			self->_progress_counter->fetch_add((uint64_t)read, std::memory_order_relaxed);
+ 		}
+diff --git a/src/serd_range_buffer.cpp b/src/serd_range_buffer.cpp
+index 8eca62e..08966ef 100644
+--- a/src/serd_range_buffer.cpp
++++ b/src/serd_range_buffer.cpp
+@@ -4,6 +4,21 @@
+ 
+ static const size_t RANGE_READ_BUFFER_SIZE = 1024 * 1024;
+ 
++// serd treats a short read as end of stream (fread semantics), but a FileHandle
++// may legitimately return less than asked for - duckdb-wasm's HTTP reads come
++// back in 16 KiB pieces - so keep reading until the request is filled or EOF.
++static int64_t ReadFully(duckdb::FileHandle &handle, void *buf, duckdb::idx_t nr_bytes) {
++	duckdb::idx_t total = 0;
++	while (total < nr_bytes) {
++		int64_t n = handle.Read(static_cast<char *>(buf) + total, nr_bytes - total);
++		if (n <= 0) {
++			break;
++		}
++		total += (duckdb::idx_t)n;
++	}
++	return (int64_t)total;
++}
++
+ SerdRangeBuffer::SerdRangeBuffer(std::string path, std::string base_uri, duckdb::FileSystem *fs, bool strict_parsing,
+                                  bool expand_prefixes, ITriplesBuffer::FileType file_type, uint64_t range_start,
+                                  uint64_t range_end, uint64_t file_size)
+@@ -71,7 +86,7 @@ void SerdRangeBuffer::StartParse() {
+ 		}
+ 		uint64_t remaining = self->_hard_stop - self->_read_pos;
+ 		idx_t to_read = (idx_t)std::min<uint64_t>(nmemb, remaining);
+-		int64_t read = self->_file_handle->Read(buf, to_read);
++		int64_t read = ReadFully(*self->_file_handle, buf, to_read);
+ 		if (read <= 0) {
+ 			self->_finished = true;
+ 			return 0;
+diff --git a/src/sparql_parser.cpp b/src/sparql_parser.cpp
+index 1111813..b6e6a69 100644
+--- a/src/sparql_parser.cpp
++++ b/src/sparql_parser.cpp
+@@ -128,14 +128,14 @@ static unique_ptr<FunctionData> EnableSparqlParserBind(ClientContext &context, T
+                                                        vector<LogicalType> &return_types, vector<string> &names) {
+ 	auto mapping_path = input.inputs[0].GetValue<string>();
+ 
+-	if (ResolveMappingFiles(mapping_path).empty()) {
++	auto paths = ResolveMappingFiles(mapping_path, &context);
++	if (paths.empty()) {
+ 		throw IOException("Mapping file not found: " + mapping_path);
+ 	}
+ 
+ 	r2rml::R2RMLMapping mapping;
+ 	try {
+-		auto paths = ResolveMappingFiles(mapping_path);
+-		mapping = ParseR2RMLOrYarrrmlMapping(paths, mapping_path, true);
++		mapping = ParseR2RMLOrYarrrmlMapping(paths, mapping_path, true, &context);
+ 	} catch (const std::runtime_error &e) {
+ 		throw InvalidInputException("R2RML/YARRRML mapping parse error: %s", e.what());
+ 	}
+diff --git a/src/sparql_to_sql.cpp b/src/sparql_to_sql.cpp
+index a77224d..9ae9490 100644
+--- a/src/sparql_to_sql.cpp
++++ b/src/sparql_to_sql.cpp
+@@ -52,14 +52,14 @@ static std::unique_ptr<sparql2sql::TypeCatalog> BuildTypeCatalog(ClientContext &
+ 
+ std::string TranslateSparqlToSql(ClientContext *context, const std::string &sparql_text,
+                                  const std::string &mapping_path) {
+-	if (ResolveMappingFiles(mapping_path).empty()) {
++	auto paths = ResolveMappingFiles(mapping_path, context);
++	if (paths.empty()) {
+ 		throw IOException("Mapping file not found: " + mapping_path);
+ 	}
+ 
+ 	r2rml::R2RMLMapping mapping;
+ 	try {
+-		auto paths = ResolveMappingFiles(mapping_path);
+-		mapping = ParseR2RMLOrYarrrmlMapping(paths, mapping_path, true);
++		mapping = ParseR2RMLOrYarrrmlMapping(paths, mapping_path, true, context);
+ 	} catch (const std::runtime_error &e) {
+ 		throw InvalidInputException("R2RML/YARRRML mapping parse error: %s", e.what());
+ 	}

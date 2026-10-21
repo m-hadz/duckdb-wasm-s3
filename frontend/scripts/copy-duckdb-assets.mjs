@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 
@@ -20,4 +20,11 @@ for (const file of files) {
   const fromVendor = existsSync(custom);
   copyFileSync(fromVendor ? custom : require.resolve(`@duckdb/duckdb-wasm/dist/${file}`), join(out, file));
   console.log(`duckdb-wasm: ${file} <- ${fromVendor ? 'vendor/duckdb-wasm-pgq' : 'npm'}`);
+}
+
+// Build propio de la extensión rdf (ver tools/duckdb-rdf-wasm); el hook la carga desde /duckdb/extensions.
+const extensions = join(process.cwd(), 'vendor', 'duckdb-rdf-wasm', 'extensions');
+if (existsSync(extensions)) {
+  cpSync(extensions, join(out, 'extensions'), { recursive: true });
+  console.log('duckdb-wasm: extensions/ <- vendor/duckdb-rdf-wasm');
 }

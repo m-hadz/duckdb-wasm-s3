@@ -10,6 +10,9 @@ type DuckDbInstance = {
 
 let instancePromise: Promise<DuckDbInstance> | null = null;
 
+// La versión de community-extensions no lee mappings ni TTL por HTTP en WASM; se usa el build parcheado.
+const RDF_EXTENSION_PATH = '/duckdb/extensions/v1.5.6/wasm_eh/rdf.duckdb_extension.wasm';
+
 function sqlString(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
@@ -59,6 +62,8 @@ async function createInstance(): Promise<DuckDbInstance> {
 
   try {
     await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+    // La extensión rdf es un build propio sin firma (ver tools/duckdb-rdf-wasm).
+    await db.open({ allowUnsignedExtensions: true });
     const conn = await db.connect();
 
     const keys = await listBucketKeys();
@@ -90,10 +95,17 @@ async function createInstance(): Promise<DuckDbInstance> {
       ${attaches}
     `);
 
-    await conn.query(`
-      INSTALL duckpgq FROM community;
-      LOAD duckpgq;
-    `);
+    await conn.query(`LOAD ${sqlString(new URL(RDF_EXTENSION_PATH, window.location.origin).href)};`);
+
+    // duckpgq solo carga con el build propio de duckdb-wasm (rama feat/duckpgq); con el de npm se omite.
+    try {
+      await conn.query(`
+        INSTALL duckpgq FROM community;
+        LOAD duckpgq;
+      `);
+    } catch (e) {
+      console.warn('DuckDB: no se pudo cargar duckpgq', e);
+    }
 
     try {
       await conn.query(`
