@@ -1,5 +1,5 @@
 extensión rdf (duck_rdf) compilada para duckdb-wasm, con los parches de tools/duckdb-rdf-wasm
-built_at:   2026-10-21T03:28:20Z
+built_at:   2026-10-21T19:47:43Z
 duck_rdf:   https://github.com/nonodename/duck_rdf @ de345a85c40ccb023d09509181a597ba99c28ffe + duck_rdf.patch
 sql2rdf:    https://github.com/nonodename/sql2rdf @ v2.2.2 + sql2rdf.patch
 duckdb:     v1.5.6 (069cc9f9b)
@@ -7,4 +7,4 @@ emscripten: emscripten/emsdk:3.1.71
 target:     wasm_eh (sin firma: requiere allowUnsignedExtensions)
 
 sha256:
-a96bb55de9d39048d9438ba46c2f176951497a86ab47dee9cbe7044b1b4b306d  extensions/v1.5.6/wasm_eh/rdf.duckdb_extension.wasm
+325f13a83b2595c0364ceb3dc0f8844d786358af6a9efa284983a0a431913e7e  extensions/v1.5.6/wasm_eh/rdf.duckdb_extension.wasm

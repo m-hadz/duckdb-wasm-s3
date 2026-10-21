@@ -34,7 +34,6 @@ que se generaba antes evaluaba a FALSE/NULL en todas las filas. Pasan los 833 te
 nuevos que fallan sin los parches. En el benchmark de la raíz, q3 bajó de 686 a 253 ms (POS) y de 7.2 a 1.3 s
 (SPO), y q5 de 503 a 235 ms, con el mismo número de filas.
 
-El `.wasm` de `frontend/vendor` todavía es el build anterior a estas dos optimizaciones; `build.sh` ya las incluye.
 
 El build no está firmado, así que el frontend abre DuckDB con `allowUnsignedExtensions: true` y lo carga con
 `LOAD '<origen>/duckdb/extensions/v1.5.6/wasm_eh/rdf.duckdb_extension.wasm'`.
