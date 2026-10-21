@@ -39,3 +39,28 @@ Para revisar el tamaño de cada row group:
 SELECT row_group_id, row_group_num_rows, sum(total_compressed_size) / 1e6 AS mb
 FROM parquet_metadata('data/tabla.parquet') GROUP BY ALL ORDER BY 1;
 ```
+
+## Tablas nativas (.duckdb)
+
+Además de los parquet, el frontend adjunta en solo lectura cada `.duckdb` que
+haya en la raíz del bucket, usando el nombre del archivo como catálogo. Para
+generar uno con una tabla nativa por cada parquet de `data/`:
+
+```bash
+scripts/build-duckdb.sh            # crea data/tables.duckdb
+docker compose up -d minio-init    # lo sube al bucket
+```
+
+En la app quedan ambas versiones para comparar:
+
+```sql
+SELECT count(*) FROM recipes;          -- vista sobre el parquet
+SELECT count(*) FROM tables.recipes;   -- tabla nativa del .duckdb
+```
+
+Si se quieren las tablas completas en memoria del browser (una descarga al
+inicio, queries posteriores sin red):
+
+```sql
+CREATE TABLE recipes_mem AS FROM tables.recipes;
+```

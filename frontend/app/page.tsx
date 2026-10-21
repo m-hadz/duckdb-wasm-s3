@@ -12,6 +12,7 @@ export default function Home() {
   const [columns, setColumns] = useState<string[]>([]);
   const [executing, setExecuting] = useState<boolean>(false);
   const [error, setError] = useState<Error | null>(null);
+  const [timing, setTiming] = useState<{ queryMs: number; convertMs: number } | null>(null);
 
   async function run() {
     if (!conn) return;
@@ -19,10 +20,18 @@ export default function Home() {
     setError(null);
     setResult([]);
     setColumns([]);
+    setTiming(null);
     try {
+      // queryMs: ida y vuelta al worker (ejecución en DuckDB + HTTP a S3 + transferencia del Arrow).
+      // convertMs: pasar el Arrow a objetos JS para la tabla; no es costo de DuckDB.
+      const t0 = performance.now();
       const res = await conn.query(queryUser);
+      const t1 = performance.now();
+      const rows = res.toArray().map((row) => row.toJSON());
+      const t2 = performance.now();
       setColumns(res.schema.fields.map((field) => field.name));
-      setResult(res.toArray().map((row) => row.toJSON()));
+      setResult(rows);
+      setTiming({ queryMs: t1 - t0, convertMs: t2 - t1 });
     } catch (error) {
       setError(error instanceof Error ? error : new Error(String(error)));
     } finally {
@@ -87,10 +96,22 @@ export default function Home() {
               {loading ? 'loading duckdb' : 'executing'}
             </span>
           )}
-          {result.length > 0 && (
+          {(timing || result.length > 0) && (
             <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-              <span className={styles.rowCount}>{columns.length} cols × {result.length} rows</span>
-              <CsvDownloadButton rows={result} filename="query_result" className={styles.downloadBtn} />
+              {timing && (
+                <span
+                  className={styles.rowCount}
+                  title="query: ejecución en DuckDB-WASM, incluidas las lecturas HTTP. convert: Arrow → filas JS."
+                >
+                  {formatMs(timing.queryMs)} query · {formatMs(timing.convertMs)} convert
+                </span>
+              )}
+              {result.length > 0 && (
+                <>
+                  <span className={styles.rowCount}>{columns.length} cols × {result.length} rows</span>
+                  <CsvDownloadButton rows={result} filename="query_result" className={styles.downloadBtn} />
+                </>
+              )}
             </div>
           )}
         </div>
@@ -121,4 +142,8 @@ export default function Home() {
       </div>
     </div>
   );
+}
+
+function formatMs(ms: number): string {
+  return ms < 1000 ? `${ms.toFixed(1)} ms` : `${(ms / 1000).toFixed(2)} s`;
 }

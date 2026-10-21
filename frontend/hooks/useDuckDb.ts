@@ -18,7 +18,7 @@ function sqlIdentifier(value: string): string {
   return `"${value.replace(/"/g, '""')}"`;
 }
 
-async function listParquetKeys(): Promise<string[]> {
+async function listBucketKeys(): Promise<string[]> {
   const keys: string[] = [];
   let token: string | null = null;
   do {
@@ -29,7 +29,7 @@ async function listParquetKeys(): Promise<string[]> {
     const xml = new DOMParser().parseFromString(await res.text(), 'application/xml');
     for (const el of xml.querySelectorAll('Contents > Key')) {
       const key = el.textContent ?? '';
-      if (key.endsWith('.parquet')) keys.push(key);
+      if (key) keys.push(key);
     }
     token =
       xml.querySelector('IsTruncated')?.textContent === 'true'
@@ -61,11 +61,24 @@ async function createInstance(): Promise<DuckDbInstance> {
     await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
     const conn = await db.connect();
 
-    const views = (await listParquetKeys())
+    const keys = await listBucketKeys();
+    const s3Url = (key: string) =>
+      new URL(`/s3/${encodeURIComponent(key)}`, window.location.origin).href;
+
+    const views = keys
+      .filter((key) => key.endsWith('.parquet'))
       .map(
         (key) =>
           `CREATE OR REPLACE VIEW ${sqlIdentifier(key.slice(0, -'.parquet'.length))} AS
-            SELECT * FROM read_parquet(${sqlString(new URL(`/s3/${encodeURIComponent(key)}`, window.location.origin).href)});`,
+            SELECT * FROM read_parquet(${sqlString(s3Url(key))});`,
+      )
+      .join('\n');
+    // Cada .duckdb del bucket se adjunta en solo lectura con su nombre como catálogo: tables.duckdb → tables.recipes
+    const attaches = keys
+      .filter((key) => key.endsWith('.duckdb'))
+      .map(
+        (key) =>
+          `ATTACH ${sqlString(s3Url(key))} AS ${sqlIdentifier(key.slice(0, -'.duckdb'.length))} (READ_ONLY);`,
       )
       .join('\n');
     await conn.query(`
@@ -74,6 +87,7 @@ async function createInstance(): Promise<DuckDbInstance> {
       SET autoload_known_extensions=true;
       LOAD httpfs;
       ${views}
+      ${attaches}
     `);
 
     await conn.query(`
