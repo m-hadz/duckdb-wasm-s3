@@ -75,6 +75,257 @@ index 29c82bc..fd6ae56 100644
  R2RMLMapping R2RMLParser::parse(const std::string &mappingFilePath, bool ignoreNonFatalErrors) {
  	TripleCollector collector;
  	collectFile(mappingFilePath, collector);
+diff --git a/src/sparql2sql/TriplePatternTranslator.cpp b/src/sparql2sql/TriplePatternTranslator.cpp
+index 1c07fcf..a31284a 100644
+--- a/src/sparql2sql/TriplePatternTranslator.cpp
++++ b/src/sparql2sql/TriplePatternTranslator.cpp
+@@ -35,6 +35,16 @@ namespace {
+ 
+ const char *const kRdfTypeIri = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+ 
++// Whether a term map can never produce `bound`: both sides' kind/datatype/language
++// are statically known and differ (an IRI against a literal map, "x"@es against an
++// @en or xsd:dateTime map, ...). The value inversion only compares lexical forms,
++// so without this a mapping with one triples map per datatype/language keeps every
++// arm for a constant term, and all but one of them are provably empty.
++bool termMapCannotProduce(const TermInfo &mapTerm, const sparql::ast::Term &bound) {
++	const TermInfo boundTerm = termInfoOfTerm(bound);
++	return isFullyDetermined(mapTerm) && isFullyDetermined(boundTerm) && dimensionsMayConflict(mapTerm, boundTerm);
++}
++
+ // One of the three positions' SQL source: either a fixed constant string, or
+ // a real R2RML TermMap evaluated against a given source-table alias (with the
+ // logical-table identity of that alias, for provenance).
+@@ -599,6 +609,9 @@ void tryAddCandidate(std::vector<RelNodePtr> &branches, const std::string &fromS
+ 	Resolved subjectR = resolveSource(subjectSrc, dialect, ctx.catalog());
+ 	addUnique(requiredNonNull, subjectR.requiredNonNull);
+ 	if (!subjectSpec.isVar) {
++		if (termMapCannotProduce(subjectR.term, *subjectSpec.boundTerm)) {
++			return;
++		}
+ 		InversionResult inv = resolveInversion(subjectSrc, *subjectSpec.boundTerm, dialect, ctx.catalog());
+ 		if (!inv.possible) {
+ 			return;
+@@ -625,6 +638,9 @@ void tryAddCandidate(std::vector<RelNodePtr> &branches, const std::string &fromS
+ 	Resolved objectR = resolveSource(objectSrc, dialect, ctx.catalog());
+ 	addUnique(requiredNonNull, objectR.requiredNonNull);
+ 	if (!objectSpec.isVar) {
++		if (termMapCannotProduce(objectR.term, *objectSpec.boundTerm)) {
++			return;
++		}
+ 		InversionResult inv = resolveInversion(objectSrc, *objectSpec.boundTerm, dialect, ctx.catalog());
+ 		if (!inv.possible) {
+ 			return;
+diff --git a/src/sparql2sql/ir/Optimizer.cpp b/src/sparql2sql/ir/Optimizer.cpp
+index 67e0661..b73988d 100644
+--- a/src/sparql2sql/ir/Optimizer.cpp
++++ b/src/sparql2sql/ir/Optimizer.cpp
+@@ -14,6 +14,7 @@
+ #include "sparql2sql/SqlDialect.h"
+ #include "sparql2sql/TagSql.h"
+ #include "sparql2sql/TemplateUtil.h"
++#include "sparql2sql/TermMapSql.h"
+ #include "sparql2sql/TranslationError.h"
+ #include "sparql2sql/TranslatedPattern.h"
+ #include "sparql2sql/TypeCatalog.h"
+@@ -900,6 +901,163 @@ bool intersects(const std::set<std::string> &a, const std::set<std::string> &b)
+ 	return false;
+ }
+ 
++// The SPARQL value space of a term whose dimension the mapping fully determines,
++// with the same classes as tagValueSpace(); kValueSpaceUnknown for anything else
++// (including a literal the mapping does not type), which every caller treats as
++// "cannot decide".
++int staticValueSpace(const TermInfo &info) {
++	if (!isFullyDetermined(info)) {
++		return kValueSpaceUnknown;
++	}
++	switch (info.kind) {
++	case RdfTermKind::Iri:
++		return kValueSpaceIri;
++	case RdfTermKind::BlankNode:
++		return kValueSpaceBlankNode;
++	case RdfTermKind::Literal:
++		break;
++	case RdfTermKind::Unknown:
++		return kValueSpaceUnknown;
++	}
++	const std::string &dt = info.datatypeIri;
++	if (!info.lang.empty()) {
++		return kValueSpaceLangString;
++	}
++	if (dt.empty()) {
++		return kValueSpaceUnknown;
++	}
++	if (isXsdNumericIri(dt)) {
++		return kValueSpaceNumeric;
++	}
++	if (dt == xsd::kString) {
++		return kValueSpaceString;
++	}
++	if (dt == xsd::kBoolean) {
++		return kValueSpaceBoolean;
++	}
++	if (dt == xsd::kDate || dt == xsd::kDateTime) {
++		return kValueSpaceTemporal;
++	}
++	return kValueSpaceUnknown;
++}
++
++// The plain string an expression is known to evaluate to in `scope`: a simple or
++// xsd:string literal, or LANG() of a term the mapping fully determines (its
++// rr:language, "" for an untagged literal). `error` is set instead when the
++// expression is a type error there (LANG() of an IRI or blank node).
++bool staticString(const sparql::ast::Expression &expr, const TranslatedPattern &scope, std::string &out,
++                  bool &error) {
++	using namespace sparql::ast;
++	if (expr.kind() == ExprKind::Literal) {
++		const RdfLiteral &lit = *static_cast<const LiteralExpr &>(expr).literal;
++		if (!lit.languageTag.empty() || (lit.datatype && lit.datatype->value != xsd::kString)) {
++			return false;
++		}
++		out = lit.lexicalForm;
++		return true;
++	}
++	if (expr.kind() != ExprKind::BuiltInCall) {
++		return false;
++	}
++	const auto &call = static_cast<const BuiltInCallExpr &>(expr);
++	if (call.fn != BuiltinFunction::Lang || call.args.size() != 1 || call.args[0]->kind() != ExprKind::VarRef) {
++		return false;
++	}
++	const TermInfo info = scope.termInfoOf(static_cast<const VarExpr &>(*call.args[0]).var->name);
++	if (!isFullyDetermined(info)) {
++		return false;
++	}
++	if (info.kind != RdfTermKind::Literal) {
++		error = true;
++		return false;
++	}
++	out = info.lang;
++	return true;
++}
++
++// The static annotation of a comparison operand that is a variable or a constant
++// term - exactly the operands whose runtime tag comparison() emits as a constant,
++// so deciding on them here agrees with the SQL it would otherwise have produced.
++// Anything computed (casts, STR(), arithmetic, ...) is Unknown.
++TermInfo operandTermInfo(const sparql::ast::Expression &expr, const TranslatedPattern &scope) {
++	using namespace sparql::ast;
++	switch (expr.kind()) {
++	case ExprKind::VarRef:
++		return scope.termInfoOf(static_cast<const VarExpr &>(expr).var->name);
++	case ExprKind::Literal:
++		return termInfoOfTerm(*static_cast<const LiteralExpr &>(expr).literal);
++	case ExprKind::IriRef: {
++		TermInfo info;
++		info.kind = RdfTermKind::Iri;
++		return info;
++	}
++	default:
++		return TermInfo();
++	}
++}
++
++// Whether a FILTER conjunct can never be TRUE against a relation whose columns
++// have the static annotations in `scope` - so a candidate arm carrying it is
++// empty. Only decides what SPARQL itself decides from the terms' dimensions
++// (17.3's operator table and RDFterm-equal), never from values in the data:
++//
++//   - LANG(?x) = "es" where the arm fixes ?x's language (or ?x is an IRI);
++//   - an ordering between two terms in different value spaces, or in one the
++//     operator table leaves out (rdf:langString, IRI, blank node) - a type error;
++//   - an equality between two terms in different value spaces - false.
++//
++// A mapping with one triples map per datatype/language (the only way YARRRML
++// can type a literal) otherwise keeps every arm of a variable-object pattern
++// alive under such a FILTER, each with a large per-row type dispatch the engine
++// has to bind and plan only to find it constant.
++bool neverTrue(const sparql::ast::Expression &expr, const TranslatedPattern &scope) {
++	using namespace sparql::ast;
++	if (expr.kind() != ExprKind::Binary) {
++		return false;
++	}
++	const auto &b = static_cast<const BinaryExpr &>(expr);
++	switch (b.op) {
++	case BinaryOp::And:
++		return neverTrue(*b.left, scope) || neverTrue(*b.right, scope);
++	case BinaryOp::Or:
++		return neverTrue(*b.left, scope) && neverTrue(*b.right, scope);
++	case BinaryOp::Eq:
++	case BinaryOp::Ne:
++	case BinaryOp::Lt:
++	case BinaryOp::Gt:
++	case BinaryOp::Le:
++	case BinaryOp::Ge:
++		break;
++	default:
++		return false;
++	}
++	const bool equality = b.op == BinaryOp::Eq || b.op == BinaryOp::Ne;
++
++	std::string ls, rs;
++	bool lerr = false, rerr = false;
++	const bool lconst = staticString(*b.left, scope, ls, lerr);
++	const bool rconst = staticString(*b.right, scope, rs, rerr);
++	if (lerr || rerr) {
++		return true;
++	}
++	if (lconst && rconst && equality) {
++		return (ls == rs) == (b.op == BinaryOp::Ne);
++	}
++
++	const int lspace = staticValueSpace(operandTermInfo(*b.left, scope));
++	const int rspace = staticValueSpace(operandTermInfo(*b.right, scope));
++	if (lspace == kValueSpaceUnknown || rspace == kValueSpaceUnknown) {
++		return false;
++	}
++	if (lspace != rspace) {
++		return b.op != BinaryOp::Ne;
++	}
++	return !equality &&
++	       (lspace == kValueSpaceLangString || lspace == kValueSpaceIri || lspace == kValueSpaceBlankNode);
++}
++
++RelNodePtr emptyWithSchema(std::vector<ColumnInfo> schema);
++
+ // Fold one FILTER conjunct into an SpjRelation's WHERE list.
+ //
+ // The predicate is rendered against a fresh sentinel alias, so every variable
+@@ -1074,13 +1232,23 @@ RelNodePtr pushConjuncts(RelNodePtr child, const std::vector<const sparql::ast::
+ 		// be folded (no context, an EXISTS conjunct, or a reference the schema
+ 		// doesn't supply) stays a FilterNode above it.
+ 		SpjRelation &spj = static_cast<SpjRelation &>(*child);
++		TranslatedPattern scope;
++		fillScopeFromSchema(scope, spj.schema());
+ 		std::vector<const sparql::ast::Expression *> keep;
+ 		keep.reserve(conjuncts.size());
++		bool empty = false;
+ 		for (const auto *c : conjuncts) {
+ 			if (ctx == nullptr || containsExists(*c) || !foldConjunctIntoSpj(spj, *c, *ctx)) {
+ 				keep.push_back(c);
++			} else if (neverTrue(*c, scope)) {
++				// Only once it translated: a conjunct this block cannot render keeps
++				// its error. propagateEmpty, run again after this pass, drops the arm.
++				empty = true;
+ 			}
+ 		}
++		if (empty) {
++			return emptyWithSchema(spj.schema());
++		}
+ 		return wrapFilters(std::move(child), keep, graph);
+ 	}
+ 	case RelKind::TransitiveClosure:
+@@ -1812,6 +1980,9 @@ RelNodePtr optimize(RelNodePtr root, const OptimizerOptions &opts) {
+ 	// Pushdown first: a conjunct folded into an SpjRelation keeps that block
+ 	// mergeable, so flattening can still fuse it with its inner-join partners.
+ 	root = pushFilters(std::move(root), opts.ctx);
++	// Pushdown can prove a candidate arm empty (a FILTER its static term
++	// dimensions can never satisfy): fold those away before flattening.
++	root = propagateEmpty(std::move(root));
+ 	root = flatten(std::move(root), opts);
+ 	selfJoinWalk(*root);
+ 	// Order matters: removing a redundant "IS NOT NULL" guard first (using
 diff --git a/src/yarrrml/MappingParserFactory.cpp b/src/yarrrml/MappingParserFactory.cpp
 index 980c46a..040cde6 100644
 --- a/src/yarrrml/MappingParserFactory.cpp
@@ -123,3 +374,88 @@ index f1cf6e9..f1ae3a4 100644
  r2rml::R2RMLMapping YARRRMLParser::parse(const std::string &yarrrmlFilePath, bool ignoreNonFatalErrors) {
  	r2rml::TripleCollector collector;
  	collectFile(yarrrmlFilePath, collector);
+diff --git a/tests/test_sparql2sql_terms.cpp b/tests/test_sparql2sql_terms.cpp
+index 0f26b57..28097ab 100644
+--- a/tests/test_sparql2sql_terms.cpp
++++ b/tests/test_sparql2sql_terms.cpp
+@@ -164,11 +164,24 @@ TEST_CASE("LANG: candidate arms tagged with different rr:language values are res
+ TEST_CASE("LANG: disagreeing rr:language candidate arms are resolved per arm by pushdown", "[sparql2sql]") {
+ 	// Without the BIND indirection above, filter pushdown distributes the
+ 	// FILTER into each union arm, where the specific language IS known - so
+-	// instead of throwing, each arm folds to its own static tag.
++	// instead of throwing, each arm folds to its own static tag, and the @fr arm,
++	// which that tag proves can never pass, is dropped altogether.
+ 	const std::string sql = translate("SELECT ?d WHERE { ?m ex:desc ?d . FILTER(lang(?d) = \"en\") }");
+ 	CHECK(contains(sql, "'en'"));
+-	CHECK(contains(sql, "'fr'"));
+-	CHECK(contains(sql, "UNION"));
++	CHECK_FALSE(contains(sql, "'fr'"));
++	CHECK_FALSE(contains(sql, "UNION"));
++}
++
++TEST_CASE("LANG: an arm whose language a FILTER rules out is dropped, not filtered", "[sparql2sql]") {
++	// <#Note>'s ex:desc is @fr: the only candidate, so the whole pattern is empty.
++	const std::string none = translate("SELECT ?d WHERE { ?m ex:desc ?d . FILTER(lang(?d) = \"de\") }");
++	CHECK_FALSE(contains(none, "UNION"));
++	CHECK_FALSE(contains(none, "'de'"));
++	// != keeps both arms: each can pass.
++	const std::string ne = translate("SELECT ?d WHERE { ?m ex:desc ?d . FILTER(lang(?d) != \"de\") }");
++	CHECK(contains(ne, "UNION"));
++	// LANG() of an IRI is a type error, so a FILTER on it can never pass either.
++	CHECK_FALSE(contains(translate("SELECT ?m WHERE { ?m ex:amount ?a . FILTER(lang(?m) = \"\") }"), "'ex.org"));
+ }
+ 
+ TEST_CASE("LANG: an rr:language arm meeting an untagged arm must not fold to the empty string", "[sparql2sql]") {
+@@ -338,3 +351,15 @@ TEST_CASE("STRLANG: a non-constant language argument builds the tag per row", "[
+ 	    translate("SELECT ?m WHERE { ?m ex:plain ?p . ?m ex:title ?t . FILTER(STRLANG(?p, ?t) = \"x\") }");
+ 	CHECK(contains(sql, "'@'"));
+ }
++
++TEST_CASE("constant object: term maps of another kind, datatype or language are not candidates", "[sparql2sql]") {
++	// ex:homepage is an IRI map: a literal object can never come from it.
++	CHECK_FALSE(contains(translate("SELECT ?m WHERE { ?m ex:homepage \"http://a.example/\" }"), "HOMEPAGE"));
++	CHECK(contains(translate("SELECT ?m WHERE { ?m ex:homepage <http://a.example/> }"), "HOMEPAGE"));
++	// ex:title is @en: only an @en literal can match it.
++	CHECK(contains(translate("SELECT ?m WHERE { ?m ex:title \"alpha\"@en }"), "TITLE"));
++	CHECK_FALSE(contains(translate("SELECT ?m WHERE { ?m ex:title \"alpha\"@fr }"), "TITLE"));
++	CHECK_FALSE(contains(translate("SELECT ?m WHERE { ?m ex:title \"alpha\" }"), "TITLE"));
++	// ex:plain does not type its literal, so it stays a candidate for any datatype.
++	CHECK(contains(translate("SELECT ?m WHERE { ?m ex:plain \"7\"^^<http://www.w3.org/2001/XMLSchema#integer> }"), "TITLE"));
++}
+diff --git a/tests/test_sparql2sql_typed_exprs.cpp b/tests/test_sparql2sql_typed_exprs.cpp
+index d6ebb21..4254e33 100644
+--- a/tests/test_sparql2sql_typed_exprs.cpp
++++ b/tests/test_sparql2sql_typed_exprs.cpp
+@@ -80,10 +80,29 @@ TEST_CASE("comparison: two known xsd:string operands emit a bare VARCHAR compari
+ 
+ TEST_CASE("comparison: a language-tagged literal is not the same type as a plain string", "[sparql2sql]") {
+ 	// rdf:langString and xsd:string are different datatypes, so this does NOT
+-	// take the bare-VARCHAR path - it falls through to the untyped form rather
+-	// than asserting an equivalence RDF does not grant.
++	// take the bare-VARCHAR path. Both dimensions are static, so the comparison is
++	// decided at translation time: "alpha"@en is never "alpha", and the pattern is
++	// empty rather than a per-row type dispatch that always answers FALSE.
+ 	const std::string sql = translate("SELECT ?m WHERE { ?m ex:title ?t . FILTER(?t = \"alpha\") }");
+-	CHECK(contains(sql, "CASE WHEN"));
++	CHECK_FALSE(contains(sql, "'alpha'"));
++	CHECK(contains(sql, "FALSE"));
++}
++
++TEST_CASE("comparison: an ordering across value spaces drops the arm", "[sparql2sql]") {
++	// xsd:decimal against xsd:dateTime is a type error (17.3), so no row passes.
++	CHECK_FALSE(contains(translate("SELECT ?m WHERE { ?m ex:price ?p . "
++	                               "FILTER(?p < \"2020-01-01T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime>) }"),
++	                     "TIMESTAMP"));
++	// Same space: still a real comparison.
++	CHECK(contains(translate("SELECT ?m WHERE { ?m ex:when ?w . "
++	                         "FILTER(?w < \"2020-01-01T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime>) }"),
++	               "TIMESTAMP"));
++	// A literal the mapping does not type keeps the numeric-aware fallback.
++	CHECK(contains(translate("SELECT ?m WHERE { ?m ex:plain ?p . FILTER(?p < \"2020\"^^<http://www.w3.org/2001/XMLSchema#dateTime>) }"),
++	               "CASE WHEN"));
++	// Under || the other disjunct can still pass.
++	CHECK(contains(translate("SELECT ?m WHERE { ?m ex:price ?p . FILTER(?p < \"2020-01-01T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime> || ?p > 5) }"),
++	               "DOUBLE"));
+ }
+ 
+ TEST_CASE("comparison: two xsd:dateTime operands compare as timestamps", "[sparql2sql]") {

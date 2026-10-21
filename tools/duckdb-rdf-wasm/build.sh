@@ -29,6 +29,11 @@ git checkout -f "$SQL2RDF_TAG"
 git submodule update --init --recursive
 git apply "$here/sql2rdf.patch"
 
+# El side module no depende de las libs de sql2rdf en CMake: sin esto un rebuild con parches nuevos
+# recompila sql2rdf pero deja el .wasm anterior.
+rm -f "$work"/duck_rdf/build/wasm_eh/extension/rdf/rdf.duckdb_extension* \
+  "$work"/duck_rdf/build/wasm_eh/repository/v1.5.6/wasm_eh/rdf.duckdb_extension.wasm
+
 docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -e SQL2RDF_SOURCE_DIR="$work/sql2rdf" \
   -v "$work:$work" -w "$work/duck_rdf" "$EMSDK_IMAGE" make wasm_eh
 

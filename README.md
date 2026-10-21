@@ -64,3 +64,59 @@ inicio, queries posteriores sin red):
 ```sql
 CREATE TABLE recipes_mem AS FROM tables.recipes;
 ```
+
+## SPARQL sobre parquets de tripletas
+
+`execute_sparql` (extensión rdf, ver `tools/duckdb-rdf-wasm`) traduce SPARQL a SQL usando un mapping YARRRML.
+Para grafos grandes no hace falta crear tablas: el mapping puede leer directo de las vistas que el hook crea
+para cada parquet, así que nada se pierde con F5 y DuckDB lee por rangos solo los row groups que necesita.
+
+1. Reescribir las tripletas como tres permutaciones ordenadas, con columnas `s, p, o, kind, datatype, lang`:
+
+   ```bash
+   scripts/prepare-triples.sh /ruta/wikidata.parquet wiki   # data/wiki_spo, wiki_pos, wiki_osp
+   ```
+
+   Acepta un parquet con esas columnas o con términos N-Triples en `s, p, o` (`<iri>`, `"x"@es`, `"5"^^<...>`).
+
+2. Generar un mapping por permutación:
+
+   ```bash
+   scripts/sparql-mapping.py data/wiki_pos.parquet wiki_pos data/mapping-pos.yml
+   scripts/sparql-mapping.py data/wiki_spo.parquet wiki_spo data/mapping-spo.yml
+   docker compose up -d minio-init   # sube parquets y mappings al bucket
+   ```
+
+   YARRRML solo permite datatype e idioma constantes, así que el script emite un triples map por cada
+   combinación presente en los datos (`iri`, `plain`, `lang_es`, `dt_dateTime`, ...), cada uno con una fuente
+   `query: "SELECT s, p, o FROM wiki_pos WHERE ..."` sobre la vista.
+
+3. Consultar:
+
+   ```sql
+   SELECT * FROM execute_sparql('
+     PREFIX wd: <http://www.wikidata.org/entity/>
+     PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+     SELECT ?s WHERE { ?s wdt:P31 wd:Q5 } LIMIT 100', 'http://localhost:3000/s3/mapping-pos.yml');
+   ```
+
+### Qué permutación usar
+
+El orden del parquet decide qué row groups puede saltarse DuckDB (estadísticas min/max por row group).
+Medido en el browser contra MinIO con un Wikidata sintético de 5.25 M tripletas (31 MB por permutación,
+53 row groups); warm = segunda ejecución en la misma instancia:
+
+| Consulta | patrón | POS warm | SPO warm | leído en frío (POS / SPO) |
+|---|---|---:|---:|---:|
+| q1 | `wd:Q42 ?p ?o` | 849 ms | **171 ms** | 17.8 / **0.6** MB |
+| q2 | `?s wdt:P31 wd:Q5` | **127 ms** | 387 ms | **1.1** / 30.2 MB |
+| q3 | estrella P31 + P569 + label `@es` | **253 ms** | 1276 ms | **7.7** / 31.5 MB |
+| q4 | `CONTAINS` sobre labels | **887 ms** | 3723 ms | **4.1** / 31.5 MB |
+| q5 | `?s ?p wd:Q4242` | **235 ms** | 439 ms | **12.7** / 24.2 MB |
+| q6 | `COUNT` por predicado | **4.2 s** | 6.6 s | 32.5 / 31.4 MB |
+
+POS sirve para casi todo (los patrones casi siempre fijan el predicado); SPO solo gana cuando el sujeto es
+constante. La primera consulta de una instancia (en frío) suma la lectura de red y de metadatos del parquet.
+
+El hook carga `httpfs`, y es necesario: sin esa extensión duckdb-wasm descarga cada parquet entero al
+crear la vista.
