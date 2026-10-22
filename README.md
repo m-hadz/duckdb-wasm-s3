@@ -78,6 +78,16 @@ para cada parquet, así que nada se pierde con F5 y DuckDB lee por rangos solo l
    ```
 
    Acepta un parquet con esas columnas o con términos N-Triples en `s, p, o` (`<iri>`, `"x"@es`, `"5"^^<...>`).
+   Si el parquet ya viene ordenado, `--keep-order` lo decodifica sin reordenar (para decenas de GB), y
+   `--compact` lee el formato con IRIs abreviadas (`wd:Q42`, prefijos en `scripts/prefixes-wikidata.csv`) y
+   literales sin comillas ni tipo:
+
+   ```bash
+   ROW_GROUP_SIZE=1000000 scripts/prepare-triples.sh --keep-order --compact data/wikidata_pos.parquet wden_pos
+   ```
+
+   Los literales de ese formato no tienen datatype, así que en SPARQL se comparan con casts:
+   `FILTER(xsd:decimal(?pop) > 1000000)`, `FILTER(xsd:dateTime(?d) >= "1900-01-01T00:00:00Z"^^xsd:dateTime)`.
 
 2. Generar un mapping por permutación:
 
